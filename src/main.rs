@@ -18,7 +18,7 @@ use futures::future::{self, Either};
 use futures::{Future, Stream};
 use std::io;
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::io::{read_to_end, write_all};
+use tokio_io::io::{read_to_end, write_all, copy};
 use std::io::Write;
 use tokio_io::codec::BytesCodec;
 
@@ -30,11 +30,9 @@ const LIFELINE1_SERVERS : [&'static str;2] = [
 ];
 
 
-fn local(handle: reactor::Handle, remote_r: Box<Stream<Item = bytes::Bytes, Error = io::Error>> )
-    -> Box<Stream<Item = bytes::BytesMut, Error = io::Error>> {
-
+fn local(handle: reactor::Handle) -> Box<Future<Item=(Box<AsyncRead>, Box<AsyncWrite>), Error=std::io::Error>> {
     let timeout = Timeout::new(Duration::from_millis(1000), &handle).unwrap();
-    let addr    = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127,0,0,1)), 1234);
+    let addr    = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127,0,0,1)), 22);
     let tcp     = TcpStream::connect(&addr, &handle);
 
     let tcp = tcp.select2(timeout).then(|res| match res {
@@ -49,20 +47,12 @@ fn local(handle: reactor::Handle, remote_r: Box<Stream<Item = bytes::Bytes, Erro
         Err(Either::B((timeout_error, _get))) => Err(From::from(timeout_error)),
     });
 
-    Box::new(tcp.map(move |stream| {
+    Box::new(tcp.and_then(move |stream| {
         info!("have local connection");
-        //let stream = CloseWithShutdown(stream);
-        let (local_w, local_r) = stream.framed(BytesCodec::new()).split();
-        let copy = remote_r.forward(local_w)
-            .then(|result| {
-                if let Err(e) = result {
-                    panic!("failed to write to socket: {}", e)
-                }
-                Ok(())
-            });
-        handle.spawn(copy);
-        local_r
-    }).flatten_stream())
+        let (local_r, local_w) = stream.split();
+        future::ok((Box::new(local_r) as Box<AsyncRead>,
+                    Box::new(local_w) as Box<AsyncWrite>))
+    }))
 }
 
 
@@ -131,22 +121,17 @@ fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
                     // anyway. the header is fixed size and fits in a single package.
                     info!("icoming control connection");
 
-                    let (remote_w, remote_r) = socket.framed(BytesCodec::new()).split();
-
-                    let remote_r = remote_r.map(|b|b.freeze());
-                    let local_r = local(handle2, Box::new(remote_r));
-                    let local_r = local_r.map(|b|b.freeze());
-
-                    local_r.forward(remote_w)
-                        .then(|result| {
-                            if let Err(e) = result {
-                                panic!("failed to write to socket: {}", e)
-                            }
-                            Ok(())
+                    let (remote_r, remote_w) = socket.split();
+                    local(handle2).and_then(|(local_r, local_w)|{
+                        let copy1 = copy(remote_r, local_w);
+                        let copy2 = copy(local_r, remote_w);
+                        copy1.select2(copy2).then(|_| {
+                            info!("stream ended");
+                            future::ok::<(), std::io::Error>(())
                         })
-                        //future::ok::<(), std::io::Error>(())
+                    })
                 })
-                .map_err(|_|()))
+                .map_err(|e|error!("{:?}",e)))
         });
 
     core.run(tcp).ok();
