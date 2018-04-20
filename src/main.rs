@@ -21,6 +21,7 @@ use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::io::{read_to_end, write_all, copy};
 use std::io::Write;
 use tokio_io::codec::BytesCodec;
+use std::{thread};
 
 
 
@@ -207,17 +208,22 @@ fn main() {
     }
     env_logger::init();
 
-    let mut ips : Vec<(&'static str, std::net::IpAddr)> = Vec::new();
-    for name in LIFELINE1_SERVERS.iter() {
-        if let Ok(mut rips) = resolve(name) {
-            for ip in rips {
-                ips.push((name,ip));
+    loop {
+
+        let mut ips : Vec<(&'static str, std::net::IpAddr)> = Vec::new();
+        for name in LIFELINE1_SERVERS.iter() {
+            if let Ok(mut rips) = resolve(name) {
+                for ip in rips {
+                    ips.push((name,ip));
+                }
             }
         }
-    }
 
-    for ip in ips {
-        remote(ip.0, ip.1).unwrap();
+        for ip in ips {
+            remote(ip.0, ip.1).unwrap();
+        }
+
+        thread::sleep(Duration::from_millis(1000));
     }
 }
 
