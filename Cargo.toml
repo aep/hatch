@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Arvid E. Picciani <aep@exys.org>"]
 
 [dependencies]
-nix = "0.10.0"
+nix = { git = "https://github.com/aep/nix.git", branch = "for-upstream" }
 failure = "0.1.1"
 tokio-core = "0.1"
 tokio-io = "0.1"
@@ -13,3 +13,4 @@ bytes = "0.4"
 trust-dns-resolver = "^0.8"
 log = "0.4"
 env_logger = "0.5.8"
+tokio-timer = "0.2"

@@ -1,12 +1,13 @@
-extern crate nix;
 extern crate failure;
 extern crate futures;
-extern crate tokio_core;
+#[macro_use]  extern crate tokio_core;
 extern crate tokio_io;
 extern crate bytes;
 extern crate trust_dns_resolver;
 #[macro_use] extern crate log;
 extern crate env_logger;
+extern crate tokio_timer;
+extern crate nix;
 
 use failure::Error;
 use tokio_core::reactor;
@@ -15,21 +16,20 @@ use tokio_core::net::TcpStream;
 use std::time::Duration;
 use std::net::SocketAddr;
 use futures::future::{self, Either};
-use futures::{Future, Stream};
-use std::io;
+use futures::{Future};
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::io::{read_to_end, write_all, copy};
 use std::io::Write;
-use tokio_io::codec::BytesCodec;
 use std::{thread};
+use std::os::unix::io::AsRawFd;
+use nix::sys::socket::{setsockopt, sockopt};
 
+mod copy;
 
-
-const LIFELINE1_SERVERS : [&'static str;2] = [
+const LIFELINE1_SERVERS : [&'static str;3] = [
+    "lifeline.hy5.berlin",
     "lifeline.exys.org",
     "lifeline.superscale.io"
 ];
-
 
 fn local(handle: reactor::Handle) -> Box<Future<Item=(Box<AsyncRead>, Box<AsyncWrite>), Error=std::io::Error>> {
     let timeout = Timeout::new(Duration::from_millis(1000), &handle).unwrap();
@@ -56,9 +56,6 @@ fn local(handle: reactor::Handle) -> Box<Future<Item=(Box<AsyncRead>, Box<AsyncW
     }))
 }
 
-
-
-
 fn build_helo(remotename: &str) -> Result<String, Error>
 {
     use nix::unistd;
@@ -74,12 +71,11 @@ fn build_helo(remotename: &str) -> Result<String, Error>
             Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
             Sec-WebSocket-Protocol: chat, superchat\r\n\
             Sec-WebSocket-Version: 13\r\n\
-            X-LF-Name: {}\r\n\
+            X-LF-Name: hatch.{}\r\n\
             \r\n",
             remotename,
             hostname))
 }
-
 
 fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
 
@@ -90,6 +86,8 @@ fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
     let mut core = reactor::Core::new()?;
     let handle  = core.handle();
     let handle2 = handle.clone();
+    let handle3 = handle.clone();
+    let handle4 = handle.clone();
 
     let timeout = Timeout::new(Duration::from_millis(1000), &handle)?;
     let tcp     = TcpStream::connect(&addr, &handle);
@@ -111,12 +109,30 @@ fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
         .and_then(move |mut stream| {
             info!("bearer connected");
 
+            let fd = stream.as_raw_fd();
+            setsockopt(fd, sockopt::KeepAlive,    &true).ok();
+            setsockopt(fd, sockopt::TcpKeepIdle,  &10).ok();
+            setsockopt(fd, sockopt::TcpKeepIntvl, &10).ok();
+            setsockopt(fd, sockopt::TcpKeepCnt,   &10).ok();
+
+
             match stream.write(&helo.as_bytes()) {
                 Ok(_)  => {},
                 Err(_) => return Box::new(future::err(())) as  Box<Future<Item=(), Error=()>>,
             };
 
+            // additional timeout for 3 hours. this is done because i don't trust SO_KEEPALIVE
+            let timeout = Timeout::new(Duration::from_secs(7800), &handle).unwrap();
+
             Box::new(tokio_io::io::read(stream, vec![0; 1024])
+                .select2(timeout).then(|res| match res {
+                    Ok(Either::A((got, _timeout))) => Ok(got),
+                    Ok(Either::B((_timeout_error, _get))) => {
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"safety reset",))
+                    },
+                    Err(Either::A((get_error, _timeout))) => Err(get_error),
+                    Err(Either::B((timeout_error, _get))) => Err(From::from(timeout_error)),
+                })
                 .and_then(|(socket, _b, _size)| {
                     // we're ignoring the content. this is ok because lifeline v1 is dead code
                     // anyway. the header is fixed size and fits in a single package.
@@ -124,8 +140,8 @@ fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
 
                     let (remote_r, remote_w) = socket.split();
                     local(handle2).and_then(|(local_r, local_w)|{
-                        let copy1 = copy(remote_r, local_w);
-                        let copy2 = copy(local_r, remote_w);
+                        let copy1 = copy::copy_with_deadline(remote_r, local_w, handle3, Duration::from_secs(60));
+                        let copy2 = copy::copy_with_deadline(local_r, remote_w, handle4, Duration::from_secs(60));
                         copy1.select2(copy2).then(|_| {
                             info!("stream ended");
                             future::ok::<(), std::io::Error>(())
@@ -199,7 +215,6 @@ fn resolve(name: &str) -> Result<(Vec<std::net::IpAddr>), Error> {
 
     Ok(response.iter().collect())
 }
-
 
 fn main() {
     use std::env;
