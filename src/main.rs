@@ -8,237 +8,79 @@ extern crate trust_dns_resolver;
 extern crate env_logger;
 extern crate tokio_timer;
 extern crate nix;
+extern crate mtdparts;
+extern crate ed25519_dalek;
+extern crate bs58;
+extern crate sha2;
+extern crate libc;
 
-use failure::Error;
-use tokio_core::reactor;
-use tokio_core::reactor::Timeout;
-use tokio_core::net::TcpStream;
-use std::time::Duration;
-use std::net::SocketAddr;
-use futures::future::{self, Either};
-use futures::{Future};
-use tokio_io::{AsyncRead, AsyncWrite};
-use std::io::Write;
-use std::{thread};
-use std::os::unix::io::AsRawFd;
-use nix::sys::socket::{setsockopt, sockopt};
+mod services;
+use std::thread;
+use std::fs::File;
+use std::io::Read;
+use ed25519_dalek::{SecretKey, PublicKey};
 
-mod copy;
-
-const LIFELINE1_SERVERS : [&'static str;3] = [
-    "lifeline.hy5.berlin",
-    "lifeline.exys.org",
-    "lifeline.superscale.io"
-];
-
-fn local(handle: reactor::Handle) -> Box<Future<Item=(Box<AsyncRead>, Box<AsyncWrite>), Error=std::io::Error>> {
-    let timeout = Timeout::new(Duration::from_millis(1000), &handle).unwrap();
-    let addr    = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127,0,0,1)), 22);
-    let tcp     = TcpStream::connect(&addr, &handle);
-
-    let tcp = tcp.select2(timeout).then(|res| match res {
-        Ok(Either::A((got, _timeout))) => Ok(got),
-        Ok(Either::B((_timeout_error, _get))) => {
-            Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Client timed out while connecting",
-                    ))
-        }
-        Err(Either::A((get_error, _timeout))) => Err(get_error),
-        Err(Either::B((timeout_error, _get))) => Err(From::from(timeout_error)),
-    });
-
-    Box::new(tcp.and_then(move |stream| {
-        info!("have local connection");
-        let (local_r, local_w) = stream.split();
-        future::ok((Box::new(local_r) as Box<AsyncRead>,
-                    Box::new(local_w) as Box<AsyncWrite>))
-    }))
-}
-
-fn build_helo(remotename: &str) -> Result<String, Error>
-{
-    use nix::unistd;
-    let mut buf = [0u8; 64];
-    let hostname_cstr = unistd::gethostname(&mut buf)?;
-    let hostname = hostname_cstr.to_str()?;
-
-    Ok(format!("GET /lifeline/1 HTTP/1.1\r\n\
-            Host: {}\r\n\
-            Upgrade: websocket\r\n\
-            Connection: Upgrade\r\n\
-            User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.63 Safari/537.36\r\n\
-            Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
-            Sec-WebSocket-Protocol: chat, superchat\r\n\
-            Sec-WebSocket-Version: 13\r\n\
-            X-LF-Name: hatch.{}\r\n\
-            \r\n",
-            remotename,
-            hostname))
-}
-
-fn remote(hostname : &str, ip: std::net::IpAddr) -> Result<(), Error> {
-
-    let addr = SocketAddr::new(ip, 80);
-    info!("connecting to {} at {}", hostname, addr);
-
-    let helo = build_helo(hostname)?;
-    let mut core = reactor::Core::new()?;
-    let handle  = core.handle();
-    let handle2 = handle.clone();
-    let handle3 = handle.clone();
-    let handle4 = handle.clone();
-
-    let timeout = Timeout::new(Duration::from_millis(1000), &handle)?;
-    let tcp     = TcpStream::connect(&addr, &handle);
-
-    let tcp = tcp.select2(timeout).then(|res| match res {
-        Ok(Either::A((got, _timeout))) => Ok(got),
-        Ok(Either::B((_timeout_error, _get))) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Client timed out while connecting",
-            ))
-        }
-        Err(Either::A((get_error, _timeout))) => Err(get_error),
-        Err(Either::B((timeout_error, _get))) => Err(From::from(timeout_error)),
-    });
-
-    let tcp = tcp
-        .map_err(|e| error!("Error: {}", e))
-        .and_then(move |mut stream| {
-            info!("bearer connected");
-
-            let fd = stream.as_raw_fd();
-            setsockopt(fd, sockopt::KeepAlive,    &true).ok();
-            setsockopt(fd, sockopt::TcpKeepIdle,  &10).ok();
-            setsockopt(fd, sockopt::TcpKeepIntvl, &10).ok();
-            setsockopt(fd, sockopt::TcpKeepCnt,   &10).ok();
-
-
-            match stream.write(&helo.as_bytes()) {
-                Ok(_)  => {},
-                Err(_) => return Box::new(future::err(())) as  Box<Future<Item=(), Error=()>>,
-            };
-
-            // additional timeout for 3 hours. this is done because i don't trust SO_KEEPALIVE
-            let timeout = Timeout::new(Duration::from_secs(7800), &handle).unwrap();
-
-            Box::new(tokio_io::io::read(stream, vec![0; 1024])
-                .select2(timeout).then(|res| match res {
-                    Ok(Either::A((got, _timeout))) => Ok(got),
-                    Ok(Either::B((_timeout_error, _get))) => {
-                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"safety reset",))
-                    },
-                    Err(Either::A((get_error, _timeout))) => Err(get_error),
-                    Err(Either::B((timeout_error, _get))) => Err(From::from(timeout_error)),
-                })
-                .and_then(|(socket, _b, _size)| {
-                    // we're ignoring the content. this is ok because lifeline v1 is dead code
-                    // anyway. the header is fixed size and fits in a single package.
-                    info!("icoming control connection");
-
-                    let (remote_r, remote_w) = socket.split();
-                    local(handle2).and_then(|(local_r, local_w)|{
-                        let copy1 = copy::copy_with_deadline(remote_r, local_w, handle3, Duration::from_secs(60));
-                        let copy2 = copy::copy_with_deadline(local_r, remote_w, handle4, Duration::from_secs(60));
-                        copy1.select2(copy2).then(|_| {
-                            info!("stream ended");
-                            future::ok::<(), std::io::Error>(())
-                        })
-                    })
-                })
-                .map_err(|e|error!("{:?}",e)))
-        });
-
-    core.run(tcp).ok();
-
-    Ok(())
-}
-
-fn resolve(name: &str) -> Result<(Vec<std::net::IpAddr>), Error> {
-    info!("resolving {}", name);
-
-    use std::net::*;
-    use trust_dns_resolver::{
-        Resolver,
-        system_conf,
+fn getidentity() -> Option<String> {
+    let f = match File::open("/proc/mtd") {
+        Ok(f) => f,
+        Err(e) => {warn!("cannot read /proc/mtd: {}", e); return None;},
     };
-    use trust_dns_resolver::config::*;
+    let parts = match mtdparts::parse_mtd(&f) {
+        Ok(v) => v,
+        Err(e) => {warn!("cannot parse /proc/mtd: {}", e); return None;},
+    };
+    let i = match parts.get("identity") {
+        Some(i) => i,
+        None  => {warn!("missing mtd partition 'identity'"); return None;},
+    };
+    let mut f = match File::open(format!("/dev/mtdblock{}", i)) {
+        Ok(f) => f,
+        Err(e) => {warn!("cannot open /dev/mtdblock{}: {}", i, e); return None;},
+    };
 
-    let mut config = ResolverConfig::new();
-    use std::error::Error;
-
-    // cloudflare
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-        protocol: Protocol::Udp
-    });
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53),
-        protocol: Protocol::Udp
-    });
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(
-                         IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,)),53),
-                         protocol: Protocol::Udp,
-    });
-
-    // google
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-        protocol: Protocol::Udp
-    });
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53),
-        protocol: Protocol::Udp
-    });
-    config.add_name_server(NameServerConfig{
-        socket_addr: SocketAddr::new(
-                         IpAddr::V6(Ipv6Addr::new(0x2001,0x4860,0x4860,0,0,0,0,0x8888,)),53),
-                         protocol: Protocol::Udp,
-    });
-
-    // from local dhcp as fallback, if all others are blocked
-    if let Ok((sysconf, _))  = system_conf::read_system_conf() {
-        for ns in sysconf.name_servers() {
-            config.add_name_server(*ns);
-        }
+    let mut buf = [0;4096];
+    if let Err(e) = f.read_exact(&mut buf) {
+        warn!("cannot read /dev/mtdblock{}: {}", i, e);
+        return None;
     }
 
-    let resolver = Resolver::new(config, ResolverOpts::default())?;
-
-    let response = match resolver.lookup_ip(name) {
-        Ok(r) => r,
-        Err(e) => return Err(failure::Error::from(std::io::Error::new(std::io::ErrorKind::Other, e.description()))),
+    let sc :SecretKey = match SecretKey::from_bytes(&buf[..32]) {
+        Ok(v) => v,
+        Err(e) => {warn!("cannot load secret data: {}", e); return None;},
     };
 
-    Ok(response.iter().collect())
+    let pk: PublicKey = PublicKey::from_secret::<sha2::Sha512>(&sc);
+
+    Some(bs58::encode(pk.as_bytes())
+        .with_alphabet(bs58::alphabet::BITCOIN)
+        .into_string())
+
 }
 
 fn main() {
     use std::env;
     if let Err(_) = env::var("RUST_LOG") {
-        env::set_var("RUST_LOG", "hatch=debug");
+        env::set_var("RUST_LOG", "hatch=info");
     }
     env_logger::init();
 
-    loop {
-
-        let mut ips : Vec<(&'static str, std::net::IpAddr)> = Vec::new();
-        for name in LIFELINE1_SERVERS.iter() {
-            if let Ok(mut rips) = resolve(name) {
-                for ip in rips {
-                    ips.push((name,ip));
-                }
-            }
+    let identity = match getidentity() {
+        Some(id) => id,
+        None => {
+            use nix::unistd;
+            let mut buf = [0u8; 64];
+            let hostname_cstr = unistd::gethostname(&mut buf).unwrap();
+            hostname_cstr.to_str().unwrap().to_string()
         }
+    };
 
-        for ip in ips {
-            remote(ip.0, ip.1).unwrap();
-        }
 
-        thread::sleep(Duration::from_millis(1000));
-    }
+    info!("using identity: {}", identity);
+
+
+    let t1 = thread::spawn(move || {
+        services::lifeline1::main(identity);
+    });
+
+    t1.join().unwrap();
 }
-

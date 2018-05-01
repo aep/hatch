@@ -4,13 +4,22 @@ version = "0.1.0"
 authors = ["Arvid E. Picciani <aep@exys.org>"]
 
 [dependencies]
-nix = { git = "https://github.com/aep/nix.git", branch = "for-upstream" }
+nix = "0.10.0"
 failure = "0.1.1"
 tokio-core = "0.1"
 tokio-io = "0.1"
 futures = "0.1.21"
 bytes = "0.4"
-trust-dns-resolver = "^0.8"
+trust-dns-resolver = {git = "https://github.com/bluejekyll/trust-dns.git"}
 log = "0.4"
 env_logger = "0.5.8"
 tokio-timer = "0.2"
+mtdparts = "0.1"
+ed25519-dalek = "0.6.2"
+bs58 = "0.2.0"
+sha2 = "0.7"
+libc = "0.2"
+
+[profile.release]
+lto = true
+panic = 'abort'

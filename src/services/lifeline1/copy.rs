@@ -5,7 +5,7 @@ use futures::{Future, Poll};
 use tokio_core::reactor::Handle;
 use futures::{Async};
 
-use {AsyncRead, AsyncWrite};
+use tokio_io::{AsyncRead, AsyncWrite};
 
 /// A future which will copy all data from a reader into a writer.
 ///
